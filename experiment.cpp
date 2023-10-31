@@ -1,9 +1,12 @@
+
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 
 #include <boost/program_options.hpp>
 #include <chrono>
+#include <fstream>
 #include <htd/main.hpp>
+#include <ios>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -17,6 +20,13 @@
 
 using namespace pds;
 
+auto now() { return std::chrono::high_resolution_clock::now(); }
+
+template <typename T>
+auto µs(T time) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(time).count();
+}
+
 void printGraph(const pds::PowerGrid& graph) {
     std::cout << "graph {\n";
 
@@ -26,6 +36,48 @@ void printGraph(const pds::PowerGrid& graph) {
                   << graph[graph.target(e)].name << "\n";
     }
     std::cout << "}\n";
+}
+
+template <typename T>
+void printSolution(const pds::PdsState& state, const std::string& filename,
+                   T start, T end) {
+    auto spent =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::ofstream file(filename);
+    auto graph = state.graph();
+    file << spent << std::endl;
+    for (auto v : graph.vertices()) {
+        if (state.isActive(v)) {
+            file << graph[v].name << " " << std::endl;
+        }
+    }
+}
+
+void printIntermediateGraph(const pds::PdsState& state,
+                            const std::string& filename) {
+    std::ofstream file(filename);
+
+    auto graph = state.graph();
+    file << graph.numVertices() << ' ' << graph.numEdges() << std::endl;
+    for (auto e : graph.edges()) {
+        file << graph[graph.source(e)].id << " " << graph[graph.target(e)].id
+             << std::endl;
+    }
+
+    file << state.numActive() << std::endl;
+    for (auto v : graph.vertices()) {
+        if (state.isActive(v)) {
+            file << graph[v].id << std::endl;
+        }
+    }
+
+    auto dependencies = state.observationGraph();
+    file << dependencies.numVertices() << ' ' << dependencies.numEdges()
+         << std::endl;
+    for (auto e : dependencies.edges()) {
+        file << dependencies.source(e) << " " << dependencies.target(e)
+             << std::endl;
+    }
 }
 
 // Utility
@@ -54,13 +106,6 @@ struct fmt::formatter<SolveState> : formatter<string_view> {
         return formatter<string_view>::format(name, ctx);
     }
 };
-
-auto now() { return std::chrono::high_resolution_clock::now(); }
-
-template <typename T>
-auto µs(T time) {
-    return std::chrono::duration_cast<std::chrono::microseconds>(time).count();
-}
 
 // Reductions
 
@@ -612,6 +657,9 @@ int main(int argc, const char** argv) {
 
             // std::cout << "Before Reduce :\n";
             // printGraph(state.graph());
+            auto filename = inputs[0].substr(
+                inputs[0].find_last_of('/'),
+                inputs[0].find_last_of('.') - inputs[0].find_last_of('/'));
 
             auto t0 = now();
             reduce(state);
@@ -621,6 +669,9 @@ int main(int argc, const char** argv) {
             size_t pmusReduced = state.numActive();
             size_t blankReduced =
                 nReduced - state.numActive() - state.numInactive();
+
+            printIntermediateGraph(
+                state, fmt::format("intermediate/{}/reduced.graph", filename));
 
             // std::cout << "After Reduce :\n";
             // printGraph(state.graph());
@@ -647,20 +698,27 @@ int main(int argc, const char** argv) {
             }
             auto t1 = now();
             if (state.allObserved()) {
-                if (boundsFile) {
-                    const auto& b =
-                        BoundInfo{state.numActive(), state.numActive(), 0,
-                                  µs(now() - t0)};
-                    double gap =
-                        (double(b.upper) - double(b.lower)) / double(b.upper);
-                    fmt::print(boundsFile, "{},{},0,{},{},{},{},0\n",
-                               currentName, run, b.time, b.lower, b.upper, gap);
-                    fflush(boundsFile);
-                }
-                result = SolveResult{state.numActive(), state.numActive(),
-                                     SolveState::Optimal};
+                printSolution(
+                    state,
+                    fmt::format("intermediate/{}/solution.graph", filename), t0,
+                    t1);
+
+                // if (boundsFile) {
+                //     const auto& b =
+                //         BoundInfo{state.numActive(), state.numActive(), 0,
+                //                   µs(now() - t0)};
+                //     double gap =
+                //         (double(b.upper) - double(b.lower)) /
+                //         double(b.upper);
+                //     fmt::print(boundsFile, "{},{},0,{},{},{},{},0\n",
+                //                currentName, run, b.time, b.lower, b.upper,
+                //                gap);
+                //     fflush(boundsFile);
+                // }
+                // result = SolveResult{state.numActive(), state.numActive(),
+                //                      SolveState::Optimal};
             } else if (subproblems) {
-                auto checkpoint = t1;
+                // auto checkpoint = t1;
                 auto subproblems = state.subproblems();
                 ranges::sort(subproblems,
                              [](const auto& left, const auto& right) {
@@ -672,56 +730,63 @@ int main(int argc, const char** argv) {
                     // std::cout << "Subproblem " << subproblemNumber << " :
                     // \n"; printGraph(substate.graph());
 
-                    if (!substate.allObserved()) {
-                        size_t initialActive = substate.numActive();
-                        size_t initialBlank = substate.numBlank();
-                        result.lower -= initialActive;
-                        result.upper -= initialBlank + initialActive;
-                        auto boundCB = [&bounds, t0, result, boundsFile,
-                                        &currentName, &subproblemNumber, run,
-                                        initialBlank, initialActive](
-                                           size_t lower, size_t upper,
-                                           size_t extra) {
-                            auto time = now();
-                            bounds.emplace_back(BoundInfo{
-                                result.lower + std::max(lower, initialActive),
-                                result.upper +
-                                    std::min(upper,
-                                             initialBlank + initialActive),
-                                extra, µs(time - t0)});
-                            if (boundsFile) {
-                                const auto& b = bounds.back();
-                                double gap =
-                                    (double(b.upper) - double(b.lower)) /
-                                    double(b.upper);
-                                fmt::print(
-                                    boundsFile, "{},{},{},{},{},{},{},{}\n",
-                                    currentName, run, subproblemNumber, b.time,
-                                    b.lower, b.upper, gap, b.extraInfo);
-                                fflush(boundsFile);
-                            }
-                        };
-                        Solver solve =
-                            getSolver(vm, fortStats, currentName, run,
-                                      subproblemNumber, boundCB);
-                        auto tSubproblem = now();
-                        double remainingTimeout = std::max(
-                            1.0, timeout - std::chrono::duration_cast<
-                                               std::chrono::seconds>(
-                                               tSubproblem - checkpoint)
-                                               .count());
-                        auto subresult = solve(substate, remainingTimeout);
-                        result.state =
-                            combineSolveState(result.state, subresult.state);
-                        state.applySubsolution(substate);
-                        result.lower +=
-                            std::max(subresult.lower, initialActive);
-                        result.upper +=
-                            std::max(subresult.upper, initialActive);
-                        boundCB(subresult.lower, subresult.upper, 0);
-                    }
+                    printIntermediateGraph(
+                        substate,
+                        fmt::format("intermediate/{}/subproblem_{}.graph",
+                                    filename, subproblemNumber));
+
+                    // if (!substate.allObserved()) {
+                    //     size_t initialActive = substate.numActive();
+                    //     size_t initialBlank = substate.numBlank();
+                    //     result.lower -= initialActive;
+                    //     result.upper -= initialBlank + initialActive;
+                    //     auto boundCB = [&bounds, t0, result, boundsFile,
+                    //                     &currentName, &subproblemNumber, run,
+                    //                     initialBlank, initialActive](
+                    //                        size_t lower, size_t upper,
+                    //                        size_t extra) {
+                    //         auto time = now();
+                    //         bounds.emplace_back(BoundInfo{
+                    //             result.lower + std::max(lower,
+                    //             initialActive), result.upper +
+                    //                 std::min(upper,
+                    //                          initialBlank + initialActive),
+                    //             extra, µs(time - t0)});
+                    //         if (boundsFile) {
+                    //             const auto& b = bounds.back();
+                    //             double gap =
+                    //                 (double(b.upper) - double(b.lower)) /
+                    //                 double(b.upper);
+                    //             fmt::print(
+                    //                 boundsFile, "{},{},{},{},{},{},{},{}\n",
+                    //                 currentName, run, subproblemNumber,
+                    //                 b.time, b.lower, b.upper, gap,
+                    //                 b.extraInfo);
+                    //             fflush(boundsFile);
+                    //         }
+                    //     };
+                    //     Solver solve =
+                    //         getSolver(vm, fortStats, currentName, run,
+                    //                   subproblemNumber, boundCB);
+                    //     auto tSubproblem = now();
+                    //     double remainingTimeout = std::max(
+                    //         1.0, timeout - std::chrono::duration_cast<
+                    //                            std::chrono::seconds>(
+                    //                            tSubproblem - checkpoint)
+                    //                            .count());
+                    //     auto subresult = solve(substate, remainingTimeout);
+                    //     result.state =
+                    //         combineSolveState(result.state, subresult.state);
+                    //     state.applySubsolution(substate);
+                    //     result.lower +=
+                    //         std::max(subresult.lower, initialActive);
+                    //     result.upper +=
+                    //         std::max(subresult.upper, initialActive);
+                    //     boundCB(subresult.lower, subresult.upper, 0);
+                    // }
                     ++subproblemNumber;
                 }
+                exit(0);
             } else {
                 auto boundCB = [&bounds, t0, boundsFile, &currentName, run](
                                    size_t lower, size_t upper, size_t extra) {
